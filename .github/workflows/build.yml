@@ -22,8 +22,8 @@ jobs:
             -fobjc-arc -fblocks -O2 -Wall -Wextra -Wno-deprecated-declarations \
             -framework Foundation -framework UIKit -framework MediaPlayer \
             -framework CoreHaptics -framework AVFoundation -framework WebKit \
-            -framework QuartzCore -framework CoreGraphics \
-            App/Main.m App/BeatService.m App/WebAuthViewController.m \
+            -framework QuartzCore -framework CoreGraphics -framework Security \
+            App/Main.m App/BeatService.m App/AuthStore.m App/WebAuthViewController.m \
             -o build/Payload/MusicBeatCompanion.app/MusicBeatCompanion
           cp App/Info.plist App/AuthCapture.js build/Payload/MusicBeatCompanion.app/
           plutil -lint build/Payload/MusicBeatCompanion.app/Info.plist

@@ -1,4 +1,6 @@
 #import "BeatService.h"
+#import "AuthStore.h"
+#import "WebAuth.h"
 #import <AVFoundation/AVFoundation.h>
 #import <CoreHaptics/CoreHaptics.h>
 #import <MediaPlayer/MediaPlayer.h>
@@ -9,6 +11,12 @@
 #import <string.h>
 
 static NSString *const BHEnabledKey = @"BeatCompanionEnabled";
+static NSString *const BHBeatIntensityKey = @"BeatIntensity";
+static NSString *const BHBeatSharpnessKey = @"BeatSharpness";
+static NSString *const BHBarIntensityKey = @"BarIntensity";
+static NSString *const BHBarSharpnessKey = @"BarSharpness";
+static NSString *const BHTimingOffsetKey = @"TimingOffsetMs";
+static NSString *const BHBackgroundDiagnosticKey = @"BackgroundDiagnostic";
 
 static BOOL BHValidID(NSString *value) {
     return value.length > 0 && value.length <= 20 &&
@@ -61,6 +69,7 @@ static NSArray<NSNumber *> *BHMilliseconds(id value) {
 @property (nonatomic, copy, readwrite) NSString *statusText;
 @property (nonatomic, copy, readwrite) NSString *trackText;
 @property (nonatomic, copy, readwrite) NSString *authText;
+@property (nonatomic, copy, readwrite) NSString *diagnosticText;
 @property (nonatomic, strong) MPMusicPlayerController *music;
 @property (nonatomic, strong) NSTimer *timer;
 @property (nonatomic, copy) NSString *songID;
@@ -95,12 +104,36 @@ static NSArray<NSNumber *> *BHMilliseconds(id value) {
     _statusText = @"Ожидание запуска";
     _trackText = @"Текущий трек: —";
     _authText = @"Web-авторизация: не получена";
+    _diagnosticText = [NSUserDefaults.standardUserDefaults stringForKey:BHBackgroundDiagnosticKey]
+        ?: @"Фон: ещё не проверялся";
+    NSDictionary *saved = [AuthStore load];
+    if ([saved[@"headers"] isKindOfClass:NSDictionary.class]) {
+        [_headers addEntriesFromDictionary:saved[@"headers"]];
+        if ([saved[@"storefront"] isKindOfClass:NSString.class]) _storefront = saved[@"storefront"];
+        if (_headers[@"Authorization"].length && _headers[@"media-user-token"].length)
+            _authText = @"Web-авторизация: восстановлена из Keychain";
+    }
+    _cookieStore = WKWebsiteDataStore.defaultDataStore.httpCookieStore;
+    [NSUserDefaults.standardUserDefaults registerDefaults:@{
+        BHBeatIntensityKey: @0.38, BHBeatSharpnessKey: @0.32,
+        BHBarIntensityKey: @0.72, BHBarSharpnessKey: @0.76,
+        BHTimingOffsetKey: @0
+    }];
+    _beatIntensity = [NSUserDefaults.standardUserDefaults floatForKey:BHBeatIntensityKey];
+    _beatSharpness = [NSUserDefaults.standardUserDefaults floatForKey:BHBeatSharpnessKey];
+    _barIntensity = [NSUserDefaults.standardUserDefaults floatForKey:BHBarIntensityKey];
+    _barSharpness = [NSUserDefaults.standardUserDefaults floatForKey:BHBarSharpnessKey];
+    _timingOffsetMs = [NSUserDefaults.standardUserDefaults integerForKey:BHTimingOffsetKey];
     _enabled = [NSUserDefaults.standardUserDefaults boolForKey:BHEnabledKey];
     _timer = [NSTimer timerWithTimeInterval:0.5 target:self selector:@selector(tick)
                                    userInfo:nil repeats:YES];
     [NSRunLoop.mainRunLoop addTimer:_timer forMode:NSRunLoopCommonModes];
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(tick)
                                                  name:UIApplicationDidBecomeActiveNotification object:nil];
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(didEnterBackground)
+                                                 name:UIApplicationDidEnterBackgroundNotification object:nil];
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(audioInterrupted:)
+                                                 name:AVAudioSessionInterruptionNotification object:nil];
     if (_enabled) dispatch_async(dispatch_get_main_queue(), ^{ [self start]; });
     return self;
 }
@@ -108,6 +141,65 @@ static NSArray<NSNumber *> *BHMilliseconds(id value) {
 - (void)publish:(NSString *)status {
     self.statusText = status;
     if (self.onChange) self.onChange();
+}
+
+- (void)recordDiagnostic:(NSString *)message {
+    self.diagnosticText = message;
+    [NSUserDefaults.standardUserDefaults setObject:message forKey:BHBackgroundDiagnosticKey];
+    if (self.onChange) self.onChange();
+}
+
+- (void)tuningChanged {
+    [self stopHaptics];
+    if (self.onChange) self.onChange();
+    if (self.enabled) [self tick];
+}
+
+- (void)setBeatIntensity:(float)value {
+    _beatIntensity = fminf(1, fmaxf(0, value));
+    [NSUserDefaults.standardUserDefaults setFloat:_beatIntensity forKey:BHBeatIntensityKey];
+    [self tuningChanged];
+}
+
+- (void)setBeatSharpness:(float)value {
+    _beatSharpness = fminf(1, fmaxf(0, value));
+    [NSUserDefaults.standardUserDefaults setFloat:_beatSharpness forKey:BHBeatSharpnessKey];
+    [self tuningChanged];
+}
+
+- (void)setBarIntensity:(float)value {
+    _barIntensity = fminf(1, fmaxf(0, value));
+    [NSUserDefaults.standardUserDefaults setFloat:_barIntensity forKey:BHBarIntensityKey];
+    [self tuningChanged];
+}
+
+- (void)setBarSharpness:(float)value {
+    _barSharpness = fminf(1, fmaxf(0, value));
+    [NSUserDefaults.standardUserDefaults setFloat:_barSharpness forKey:BHBarSharpnessKey];
+    [self tuningChanged];
+}
+
+- (void)setTimingOffsetMs:(NSInteger)value {
+    _timingOffsetMs = MAX(-500, MIN(500, value));
+    [NSUserDefaults.standardUserDefaults setInteger:_timingOffsetMs forKey:BHTimingOffsetKey];
+    [self tuningChanged];
+}
+
+- (void)didEnterBackground {
+    if (!self.enabled) return;
+    // A real background-audio session may keep the companion runnable;
+    // Core Haptics can still be suspended independently by iOS.
+    if (self.music.playbackState == MPMusicPlaybackStatePlaying) [self startKeepAlive];
+    [self recordDiagnostic:[NSString stringWithFormat:@"Фон: аудиосеанс %@",
+        self.keepAlive.playing ? @"запущен" : @"не запущен"]];
+    [self tick];
+}
+
+- (void)audioInterrupted:(NSNotification *)notification {
+    NSNumber *type = notification.userInfo[AVAudioSessionInterruptionTypeKey];
+    if (type.unsignedIntegerValue != AVAudioSessionInterruptionTypeEnded || !self.enabled) return;
+    [self stopKeepAlive];
+    [self tick];
 }
 
 - (BOOL)authorizedForLibrary {
@@ -180,6 +272,7 @@ static NSArray<NSNumber *> *BHMilliseconds(id value) {
     NSAssert([NSThread isMainThread], @"Web headers must be handled on the main thread");
     NSURL *parsed = [NSURL URLWithString:url];
     if (![parsed.host.lowercaseString isEqualToString:@"amp-api.music.apple.com"]) return;
+    NSDictionary *previous = [self.headers copy];
     for (NSString *key in @[@"Authorization", @"media-user-token", @"x-apple-client-version"]) {
         NSString *value = BHHeader(headers, key);
         if (value.length > 0 && value.length < 12000) self.headers[key] = value;
@@ -192,9 +285,20 @@ static NSArray<NSNumber *> *BHMilliseconds(id value) {
     }
     BOOL ready = self.headers[@"Authorization"].length > 0 &&
                  self.headers[@"media-user-token"].length > 0;
-    self.authText = ready ? @"Web-авторизация: получена" : @"Web-авторизация: ожидается вход";
+    self.authText = ready ? @"Web-авторизация: получена и сохранена" : @"Web-авторизация: ожидается вход";
+    if (ready && ![previous isEqualToDictionary:self.headers]) {
+        [AuthStore saveHeaders:self.headers storefront:self.storefront];
+        self.retryAfter = 0;
+    }
     if (self.onChange) self.onChange();
     if (ready && self.songID && !self.beats.count && !self.fetching) [self fetchAnalysis];
+}
+
+- (void)clearAuthorization {
+    [AuthStore clear];
+    [self.headers removeAllObjects];
+    self.authText = @"Web-авторизация: удалена из Keychain";
+    if (self.onChange) self.onChange();
 }
 
 - (void)fetchAnalysis {
@@ -239,6 +343,7 @@ static NSArray<NSNumber *> *BHMilliseconds(id value) {
                 if (!self.beats.count) {
                     [self publish:[NSString stringWithFormat:@"Beat map недоступна: HTTP %ld%@",
                         (long)status, error ? [NSString stringWithFormat:@", %@", error.localizedDescription] : @""]];
+                    if (status == 401 || status == 403) BHRefreshWebAuth();
                 }
             });
         }];
@@ -259,6 +364,8 @@ static NSArray<NSNumber *> *BHMilliseconds(id value) {
     self.engine.stoppedHandler = ^(CHHapticEngineStoppedReason reason) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [weakSelf stopHaptics];
+            [weakSelf recordDiagnostic:[NSString stringWithFormat:
+                @"Core Haptics остановлен системой: причина %ld", (long)reason]];
             [weakSelf publish:[NSString stringWithFormat:@"Движок остановлен (%ld)", (long)reason]];
         });
     };
@@ -277,19 +384,32 @@ static NSArray<NSNumber *> *BHMilliseconds(id value) {
         return;
     }
     NSMutableArray<CHHapticEvent *> *events = NSMutableArray.array;
-    NSUInteger barIndex = 0;
-    for (NSNumber *beat in self.beats) {
-        NSInteger ms = beat.integerValue;
-        while (barIndex < self.bars.count && self.bars[barIndex].integerValue < ms - 55) barIndex++;
-        BOOL accent = barIndex < self.bars.count &&
-            labs(self.bars[barIndex].longValue - beat.longValue) <= 55;
+    if (self.beatIntensity > 0.001f) {
         CHHapticEventParameter *intensity = [[CHHapticEventParameter alloc]
-            initWithParameterID:CHHapticEventParameterIDHapticIntensity value:accent ? 0.72f : 0.38f];
+            initWithParameterID:CHHapticEventParameterIDHapticIntensity value:self.beatIntensity];
         CHHapticEventParameter *sharpness = [[CHHapticEventParameter alloc]
-            initWithParameterID:CHHapticEventParameterIDHapticSharpness value:accent ? 0.62f : 0.46f];
-        [events addObject:[[CHHapticEvent alloc] initWithEventType:CHHapticEventTypeHapticTransient
-            parameters:@[intensity, sharpness] relativeTime:beat.doubleValue / 1000.0]];
+            initWithParameterID:CHHapticEventParameterIDHapticSharpness value:self.beatSharpness];
+        for (NSNumber *beat in self.beats) {
+            [events addObject:[[CHHapticEvent alloc] initWithEventType:CHHapticEventTypeHapticTransient
+                parameters:@[intensity, sharpness] relativeTime:beat.doubleValue / 1000.0]];
+        }
     }
+    if (self.barIntensity > 0.001f) {
+        CHHapticEventParameter *intensity = [[CHHapticEventParameter alloc]
+            initWithParameterID:CHHapticEventParameterIDHapticIntensity value:self.barIntensity];
+        CHHapticEventParameter *sharpness = [[CHHapticEventParameter alloc]
+            initWithParameterID:CHHapticEventParameterIDHapticSharpness value:self.barSharpness];
+        for (NSNumber *bar in self.bars) {
+            [events addObject:[[CHHapticEvent alloc] initWithEventType:CHHapticEventTypeHapticTransient
+                parameters:@[intensity, sharpness] relativeTime:bar.doubleValue / 1000.0]];
+        }
+    }
+    if (events.count == 0) return;
+    [events sortUsingComparator:^NSComparisonResult(CHHapticEvent *a, CHHapticEvent *b) {
+        if (a.relativeTime < b.relativeTime) return NSOrderedAscending;
+        if (a.relativeTime > b.relativeTime) return NSOrderedDescending;
+        return NSOrderedSame;
+    }];
     CHHapticPattern *pattern = [[CHHapticPattern alloc] initWithEvents:events parameterCurves:@[] error:&error];
     if (!pattern) { [self publish:[NSString stringWithFormat:@"Ошибка паттерна: %@", error]]; return; }
     self.patternPlayer = [self.engine createAdvancedPlayerWithPattern:pattern error:&error];
@@ -312,6 +432,12 @@ static NSArray<NSNumber *> *BHMilliseconds(id value) {
     uint16_t alignment = 2; memcpy(bytes + 32, &alignment, 2);
     uint16_t bits = 16; memcpy(bytes + 34, &bits, 2);
     memcpy(bytes + 36, "data", 4); memcpy(bytes + 40, &dataLength, 4);
+    // Near-inaudible one-bit-amplitude waveform rather than a zero-volume
+    // stream, which iOS may optimize away in the background.
+    for (uint32_t sampleIndex = 0; sampleIndex < sampleRate; sampleIndex++) {
+        int16_t sample = (sampleIndex / 80) % 2 ? 1 : -1;
+        memcpy(bytes + 44 + sampleIndex * 2, &sample, 2);
+    }
     return data;
 }
 
@@ -327,7 +453,7 @@ static NSArray<NSNumber *> *BHMilliseconds(id value) {
     }
     self.keepAlive = [[AVAudioPlayer alloc] initWithData:[self silentWAV] error:&error];
     self.keepAlive.numberOfLoops = -1;
-    self.keepAlive.volume = 0;
+    self.keepAlive.volume = 1;
     if (![self.keepAlive play]) [self publish:[NSString stringWithFormat:@"Фоновое аудио не стартовало: %@", error]];
 }
 
@@ -367,7 +493,7 @@ static NSArray<NSNumber *> *BHMilliseconds(id value) {
         else if (!self.fetching) [self publish:@"Открой Web-вход для автоматической загрузки beat map"];
         return;
     }
-    NSTimeInterval position = self.music.currentPlaybackTime;
+    NSTimeInterval position = self.music.currentPlaybackTime + self.timingOffsetMs / 1000.0;
     if (!isfinite(position) || position < 0) position = 0;
     [self preparePattern];
     if (!self.patternPlayer) return;

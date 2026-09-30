@@ -10,7 +10,13 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, copy, readonly) NSString *statusText;
 @property (nonatomic, copy, readonly) NSString *trackText;
 @property (nonatomic, copy, readonly) NSString *authText;
+@property (nonatomic, copy, readonly) NSString *diagnosticText;
 @property (nonatomic, strong, nullable) WKHTTPCookieStore *cookieStore;
+@property (nonatomic) float beatIntensity;
+@property (nonatomic) float beatSharpness;
+@property (nonatomic) float barIntensity;
+@property (nonatomic) float barSharpness;
+@property (nonatomic) NSInteger timingOffsetMs;
 
 + (instancetype)shared;
 - (void)start;
@@ -18,6 +24,7 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)testPulse;
 - (void)acceptWebHeaders:(NSDictionary<NSString *, NSString *> *)headers
                     url:(NSString *)url;
+- (void)clearAuthorization;
 @end
 
 NS_ASSUME_NONNULL_END

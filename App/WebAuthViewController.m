@@ -1,6 +1,71 @@
 #import <UIKit/UIKit.h>
 #import <WebKit/WebKit.h>
 #import "BeatService.h"
+#import "WebAuth.h"
+
+static NSURL *BHMusicWebURL(void) {
+    return [NSURL URLWithString:@"https://music.apple.com/tr/album/birds-of-a-feather/1739659134?i=1739659142"];
+}
+
+static WKWebViewConfiguration *BHWebConfiguration(id<WKScriptMessageHandler> handler) {
+    NSString *path = [NSBundle.mainBundle pathForResource:@"AuthCapture" ofType:@"js"];
+    NSString *source = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+    WKUserContentController *controller = [WKUserContentController new];
+    if (source.length) [controller addUserScript:[[WKUserScript alloc] initWithSource:source
+        injectionTime:WKUserScriptInjectionTimeAtDocumentStart forMainFrameOnly:NO]];
+    [controller addScriptMessageHandler:handler name:@"beatAuth"];
+    WKWebViewConfiguration *configuration = [WKWebViewConfiguration new];
+    configuration.userContentController = controller;
+    configuration.websiteDataStore = WKWebsiteDataStore.defaultDataStore;
+    return configuration;
+}
+
+static void BHHandleAuthMessage(WKScriptMessage *message) {
+    if (![message.frameInfo.securityOrigin.host.lowercaseString isEqualToString:@"music.apple.com"] ||
+        ![message.body isKindOfClass:NSDictionary.class]) return;
+    NSDictionary *payload = message.body;
+    if (![payload[@"headers"] isKindOfClass:NSDictionary.class] ||
+        ![payload[@"url"] isKindOfClass:NSString.class]) return;
+    [BeatService.shared acceptWebHeaders:payload[@"headers"] url:payload[@"url"]];
+}
+
+@interface BHHiddenWebAuth : NSObject <WKScriptMessageHandler>
+@property (nonatomic, strong) WKWebView *webView;
+@property (nonatomic) NSTimeInterval lastReload;
++ (instancetype)shared;
+- (void)attachToHost:(UIView *)host;
+- (void)reload;
+@end
+
+@implementation BHHiddenWebAuth
++ (instancetype)shared {
+    static BHHiddenWebAuth *probe;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ probe = [BHHiddenWebAuth new]; });
+    return probe;
+}
+- (void)attachToHost:(UIView *)host {
+    if (self.webView) return;
+    self.webView = [[WKWebView alloc] initWithFrame:CGRectMake(-2, -2, 1, 1)
+        configuration:BHWebConfiguration(self)];
+    self.webView.alpha = 0.01;
+    self.webView.userInteractionEnabled = NO;
+    [host addSubview:self.webView];
+    BeatService.shared.cookieStore = self.webView.configuration.websiteDataStore.httpCookieStore;
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(reload)
+        name:UIApplicationDidBecomeActiveNotification object:nil];
+    [self reload];
+}
+- (void)reload {
+    if (!self.webView || NSDate.date.timeIntervalSince1970 - self.lastReload < 30) return;
+    self.lastReload = NSDate.date.timeIntervalSince1970;
+    [self.webView loadRequest:[NSURLRequest requestWithURL:BHMusicWebURL()]];
+}
+- (void)userContentController:(WKUserContentController *)controller
+      didReceiveScriptMessage:(WKScriptMessage *)message {
+    BHHandleAuthMessage(message);
+}
+@end
 
 @interface WebAuthViewController : UIViewController <WKScriptMessageHandler, WKNavigationDelegate>
 @property (nonatomic, strong) WKWebView *webView;
@@ -18,15 +83,7 @@
     self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc]
         initWithBarButtonSystemItem:UIBarButtonSystemItemRefresh target:self action:@selector(reload)];
 
-    NSString *path = [NSBundle.mainBundle pathForResource:@"AuthCapture" ofType:@"js"];
-    NSString *source = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
-    WKUserContentController *controller = [WKUserContentController new];
-    if (source.length) [controller addUserScript:[[WKUserScript alloc] initWithSource:source
-        injectionTime:WKUserScriptInjectionTimeAtDocumentStart forMainFrameOnly:NO]];
-    [controller addScriptMessageHandler:self name:@"beatAuth"];
-    WKWebViewConfiguration *configuration = [WKWebViewConfiguration new];
-    configuration.userContentController = controller;
-    configuration.websiteDataStore = WKWebsiteDataStore.defaultDataStore;
+    WKWebViewConfiguration *configuration = BHWebConfiguration(self);
     self.webView = [[WKWebView alloc] initWithFrame:CGRectZero configuration:configuration];
     self.webView.navigationDelegate = self;
     self.webView.translatesAutoresizingMaskIntoConstraints = NO;
@@ -34,7 +91,7 @@
     [self.view addSubview:self.webView];
 
     self.hint = [UILabel new];
-    self.hint.text = @"Войди в Apple Music здесь. После загрузки страницы вернись к компаньону — токены остаются только в памяти приложения.";
+    self.hint.text = @"Войди в Apple Music здесь. После загрузки страницы вернись к компаньону — токены хранятся только в Keychain этого iPhone.";
     self.hint.numberOfLines = 0;
     self.hint.font = [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote];
     self.hint.textColor = UIColor.secondaryLabelColor;
@@ -59,18 +116,12 @@
 }
 
 - (void)reload {
-    NSURL *url = [NSURL URLWithString:@"https://music.apple.com/tr/album/birds-of-a-feather/1739659134?i=1739659142"];
-    [self.webView loadRequest:[NSURLRequest requestWithURL:url]];
+    [self.webView loadRequest:[NSURLRequest requestWithURL:BHMusicWebURL()]];
 }
 
 - (void)userContentController:(WKUserContentController *)controller
       didReceiveScriptMessage:(WKScriptMessage *)message {
-    if (![message.frameInfo.securityOrigin.host.lowercaseString isEqualToString:@"music.apple.com"] ||
-        ![message.body isKindOfClass:NSDictionary.class]) return;
-    NSDictionary *payload = message.body;
-    if (![payload[@"headers"] isKindOfClass:NSDictionary.class] ||
-        ![payload[@"url"] isKindOfClass:NSString.class]) return;
-    [BeatService.shared acceptWebHeaders:payload[@"headers"] url:payload[@"url"]];
+    BHHandleAuthMessage(message);
 }
 
 - (void)webView:(WKWebView *)webView didFailNavigation:(WKNavigation *)navigation
@@ -92,3 +143,7 @@
 UIViewController *BHCreateWebAuthController(void) {
     return [[UINavigationController alloc] initWithRootViewController:[WebAuthViewController new]];
 }
+
+void BHWarmWebAuth(UIView *host) { [[BHHiddenWebAuth shared] attachToHost:host]; }
+
+void BHRefreshWebAuth(void) { [[BHHiddenWebAuth shared] reload]; }
