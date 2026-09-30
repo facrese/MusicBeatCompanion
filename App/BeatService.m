@@ -121,6 +121,7 @@ static NSArray<NSNumber *> *BHMilliseconds(id value) {
     if (authorization == MPMediaLibraryAuthorizationStatusNotDetermined) {
         [self publish:@"Разреши доступ к медиатеке для определения трека"];
         [MPMediaLibrary requestAuthorization:^(MPMediaLibraryAuthorizationStatus result) {
+            (void)result;
             dispatch_async(dispatch_get_main_queue(), ^{ [self tick]; });
         }];
         return;
