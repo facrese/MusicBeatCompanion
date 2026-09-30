@@ -1,0 +1,45 @@
+name: Build companion IPA
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'App/**'
+      - '.github/workflows/build.yml'
+
+jobs:
+  build:
+    runs-on: macos-15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile arm64 iOS app
+        run: |
+          set -euo pipefail
+          mkdir -p build/Payload/MusicBeatCompanion.app
+          xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.1 \
+            -fobjc-arc -fblocks -O2 -Wall -Wextra -Wno-deprecated-declarations \
+            -framework Foundation -framework UIKit -framework MediaPlayer \
+            -framework CoreHaptics -framework AVFoundation -framework WebKit \
+            -framework QuartzCore \
+            App/Main.m App/BeatService.m App/WebAuthViewController.m \
+            -o build/Payload/MusicBeatCompanion.app/MusicBeatCompanion
+          cp App/Info.plist App/AuthCapture.js build/Payload/MusicBeatCompanion.app/
+          plutil -lint build/Payload/MusicBeatCompanion.app/Info.plist
+          codesign --force --sign - build/Payload/MusicBeatCompanion.app
+          cd build
+          zip -q -r MusicBeatCompanion.ipa Payload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MusicBeatCompanion-ios16
+          path: build/MusicBeatCompanion.ipa
+      - name: Publish test IPA
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create companion-test build/MusicBeatCompanion.ipa \
+            --title 'Music Beat Companion test build' \
+            --notes 'Experimental iOS 16.1 companion; no Apple binaries or tokens. Device validation required.' \
+            --prerelease --target "$GITHUB_SHA" || \
+          gh release upload companion-test build/MusicBeatCompanion.ipa --clobber
